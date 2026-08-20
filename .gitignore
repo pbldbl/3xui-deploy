@@ -1,0 +1,10 @@
+# ничего с реальными доступами в репозиторий
+*.env
+install-result.env
+*-root-password.txt
+*.key
+*.crt
+*.pem
+x-ui.db*
+passport*.json
+.DS_Store
