@@ -22,6 +22,7 @@ REMARK=""
 CLIENT_EMAIL=""
 SKIP_TRAFFICGUARD=0
 SKIP_DNS_CHECK=0
+HARDEN_SSH=0
 
 RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[1;33m'; NC=$'\033[0m'
 step() { printf '\n%s==> %s%s\n' "$GRN" "$1" "$NC"; }
@@ -47,6 +48,7 @@ usage() {
   --dest HOST          цель маскировки Reality (по умолчанию: github.com)
   --remark TEXT        имя inbound'а (по умолчанию: <CODE>-Reality-443)
   --skip-trafficguard  не ставить TrafficGuard
+  --harden-ssh         отключить вход по паролю (только при наличии SSH-ключа)
   --skip-dns-check     не проверять A-запись перед выпуском сертификата
   -h, --help           эта справка
 USAGE
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --dest)              DEST="$2"; shift 2 ;;
     --remark)            REMARK="$2"; shift 2 ;;
     --skip-trafficguard) SKIP_TRAFFICGUARD=1; shift ;;
+    --harden-ssh)        HARDEN_SSH=1; shift ;;
     --skip-dns-check)    SKIP_DNS_CHECK=1; shift ;;
     -h|--help)           usage; exit 0 ;;
     *) die "неизвестный аргумент: $1" ;;
@@ -243,6 +246,37 @@ if [[ $SKIP_TRAFFICGUARD -eq 0 ]]; then
     echo "ipset: $V4 подсетей, цепочка: $(iptables -S ufw-before-input | grep -c 'j SCANNERS-BLOCK')"
   else
     warn "TrafficGuard не установился — проверь вручную: /opt/trafficguard-manager.sh install"
+  fi
+fi
+
+# ---------------------------------------------------------------- 8a. SSH
+if [[ $HARDEN_SSH -eq 1 ]]; then
+  step "Отключение входа по паролю"
+  # Без ключа не трогаем ничего — иначе гарантированный лок-аут.
+  KEYFOUND=0
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [[ -s "$f" ]] && grep -qE '^(ssh|ecdsa)-' "$f" && KEYFOUND=1 && break
+  done
+  if [[ $KEYFOUND -eq 0 ]]; then
+    warn "authorized_keys не найден — вход по паролю оставлен включённым"
+  else
+    mkdir -p /etc/ssh/sshd_config.d
+    printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+      > /etc/ssh/sshd_config.d/99-harden.conf
+    # cloud-init и подобные кладут свои drop-in, которые включают пароль обратно
+    for d in /etc/ssh/sshd_config.d/*.conf; do
+      [[ "$d" == */99-harden.conf ]] && continue
+      grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$d" 2>/dev/null \
+        && sed -i -E 's/^[[:space:]]*(PasswordAuthentication[[:space:]]+yes)/# \1  # отключено deploy.sh/I' "$d" \
+        && echo "  поправлен $d"
+    done
+    if sshd -t 2>/dev/null; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+      echo "PasswordAuthentication: $(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')"
+    else
+      rm -f /etc/ssh/sshd_config.d/99-harden.conf
+      warn "sshd -t не прошёл, изменения откачены"
+    fi
   fi
 fi
 
