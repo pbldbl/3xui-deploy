@@ -21,6 +21,7 @@ DEST="github.com"
 REMARK=""
 CLIENT_EMAIL=""
 SKIP_TRAFFICGUARD=0
+SKIP_TORRENT_BLOCK=0
 SKIP_DNS_CHECK=0
 HARDEN_SSH=0
 
@@ -48,6 +49,7 @@ usage() {
   --dest HOST          цель маскировки Reality (по умолчанию: github.com)
   --remark TEXT        имя inbound'а (по умолчанию: <CODE>-Reality-443)
   --skip-trafficguard  не ставить TrafficGuard
+  --skip-torrent-block не ставить блокировку торрентов
   --harden-ssh         отключить вход по паролю (только при наличии SSH-ключа)
   --skip-dns-check     не проверять A-запись перед выпуском сертификата
   -h, --help           эта справка
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --dest)              DEST="$2"; shift 2 ;;
     --remark)            REMARK="$2"; shift 2 ;;
     --skip-trafficguard) SKIP_TRAFFICGUARD=1; shift ;;
+    --skip-torrent-block) SKIP_TORRENT_BLOCK=1; shift ;;
     --harden-ssh)        HARDEN_SSH=1; shift ;;
     --skip-dns-check)    SKIP_DNS_CHECK=1; shift ;;
     -h|--help)           usage; exit 0 ;;
@@ -249,6 +252,24 @@ if [[ $SKIP_TRAFFICGUARD -eq 0 ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 8b. торренты
+if [[ $SKIP_TORRENT_BLOCK -eq 0 ]]; then
+  step "Блокировка торрентов (DPI)"
+  # Работает в дополнение к правилу Xray bittorrent -> blocked: то отсекает
+  # торрент внутри туннеля, это — исходящий поиск пиров с самого сервера.
+  TB_URL="https://raw.githubusercontent.com/pbldbl/3xui-torrent-block/main/torrent-block-install.sh"
+  if curl -fsSL -o /root/torrent-block-install.sh "$TB_URL"; then
+    bash /root/torrent-block-install.sh </dev/null >/dev/null 2>&1 || true
+    if systemctl is-active --quiet torrent-block 2>/dev/null; then
+      echo "torrent-block: активен, правил в цепочке $(iptables -S TORRENT_BLOCK 2>/dev/null | wc -l)"
+    else
+      warn "torrent-block не поднялся — проверь: bash /root/torrent-block-install.sh"
+    fi
+  else
+    warn "не удалось скачать установщик torrent-block"
+  fi
+fi
+
 # ---------------------------------------------------------------- 8a. SSH
 if [[ $HARDEN_SSH -eq 1 ]]; then
   step "Отключение входа по паролю"
@@ -260,22 +281,37 @@ if [[ $HARDEN_SSH -eq 1 ]]; then
   if [[ $KEYFOUND -eq 0 ]]; then
     warn "authorized_keys не найден — вход по паролю оставлен включённым"
   else
+    cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%s)"
     mkdir -p /etc/ssh/sshd_config.d
     printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
       > /etc/ssh/sshd_config.d/99-harden.conf
-    # cloud-init и подобные кладут свои drop-in, которые включают пароль обратно
+
+    # cloud-init и подобные кладут свои drop-in с PasswordAuthentication yes.
+    # В OpenSSH выигрывает ПЕРВАЯ директива, а 50-/60- читаются раньше 99-.
     for d in /etc/ssh/sshd_config.d/*.conf; do
       [[ "$d" == */99-harden.conf ]] && continue
       grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$d" 2>/dev/null \
         && sed -i -E 's/^[[:space:]]*(PasswordAuthentication[[:space:]]+yes)/# \1  # отключено deploy.sh/I' "$d" \
         && echo "  поправлен $d"
     done
-    if sshd -t 2>/dev/null; then
-      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-      echo "PasswordAuthentication: $(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')"
+
+    reload_sshd() { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
+    sshd -t 2>/dev/null && reload_sshd
+
+    # Часть образов вообще не подключает sshd_config.d (нет строки Include),
+    # и тогда drop-in не читается. Проверяем результат, а не факт записи.
+    if [[ "$(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')" == "yes" ]]; then
+      echo "  drop-in не подействовал, правлю /etc/ssh/sshd_config"
+      sed -i -E 's/^[[:space:]]*(PasswordAuthentication[[:space:]]+yes)/PasswordAuthentication no  # было: \1/I' \
+        /etc/ssh/sshd_config
+      sshd -t 2>/dev/null && reload_sshd
+    fi
+
+    RESULT="$(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')"
+    if [[ "$RESULT" == "no" ]]; then
+      echo "PasswordAuthentication: no"
     else
-      rm -f /etc/ssh/sshd_config.d/99-harden.conf
-      warn "sshd -t не прошёл, изменения откачены"
+      warn "не удалось отключить вход по паролю (сейчас: ${RESULT:-?}) — проверь /etc/ssh/sshd_config вручную"
     fi
   fi
 fi
