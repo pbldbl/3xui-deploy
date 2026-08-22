@@ -94,8 +94,9 @@ if [[ $SKIP_DNS_CHECK -eq 0 ]]; then
   RESOLVED="$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | head -1 || true)"
   echo "$DOMAIN → ${RESOLVED:-(не резолвится)}"
   [[ "$RESOLVED" == "$PUBLIC_IP" ]] || die "A-запись $DOMAIN не указывает на $PUBLIC_IP. Поправь DNS или запусти с --skip-dns-check"
-  # AAAA, указывающая на другой хост, ломает валидацию Let's Encrypt
-  AAAA="$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+  # AAAA, указывающая на другой хост, ломает валидацию Let's Encrypt.
+  # getent отдаёт IPv4-mapped вида ::ffff:1.2.3.4, когда AAAA нет — отсеиваем.
+  AAAA="$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '{print $1}' | grep -viE '^::ffff:' | head -1 || true)"
   if [[ -n "$AAAA" ]]; then
     ip -6 -o addr show scope global | grep -q "${AAAA%/*}" \
       || warn "AAAA-запись ($AAAA) не принадлежит этому серверу — Let's Encrypt может уйти валидироваться туда"
@@ -104,6 +105,7 @@ fi
 
 # ---------------------------------------------------------------- 1. пакеты
 step "Пакеты"
+hostnamectl set-hostname "$DOMAIN" 2>/dev/null && echo "hostname: $DOMAIN"
 export DEBIAN_FRONTEND=noninteractive
 # unattended-upgrades часто держит dpkg на свежей машине
 for _ in $(seq 1 60); do
